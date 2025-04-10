@@ -1,25 +1,20 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <PubSubClient.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
 #include "MQ135.h"
 #include <SPI.h>
 #include <MFRC522.h>
-#include <Servo.h>
 
 #define SS_PIN D8
 #define RST_PIN D0
 #define SERVO_PIN D1 // Chân D1 (GPIO5) dùng cho Servo
 
-#define EEPROM_SIZE 512
-#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define RESET_BUTTON_PIN D2
-
 String rfid_uids[10]; // Giả sử tối đa 10 UID
 
 MFRC522 rfid(SS_PIN, RST_PIN);
-Servo myServo;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -33,100 +28,51 @@ Kết nối WiFi và MQTT thành công: "connected"
 */
 String statusDevice = "";
 
-char wifiSSID[32] = "hoang";
+char wifiSSID[32] = "zunoiot";
 char wifiPass[64] = "1234567899";
-char mqttUser[32] = "UGWFFT06CjCTqTDGtEMp";
-char mqttServer[32] = "192.168.218.181";
+char mqttUser[32] = "ZiMrNROOWph6pTLfIXJt";
+char mqttServer[32] = "139.59.97.249";
 char *mqttPass = "";
 char *mqttTopic = "v1/devices/me/telemetry";
 int mqttPort = 1883;
+
+String fw_title = "";
+String fw_version = "v0.0.2";
+String fw_tag = "";
+int fw_size = 0;
+String fw_checksum_algorithm = "";
+String fw_checksum = "";
 
 bool wifiConnected = false;
 bool mqttConnected = false;
 
 void setWarnLed(const int type);
-void setupBLE();
 bool connectToWiFi(const char *ssid, const char *password);
 bool connectToMQTT();
 void sendDataMqtt();
 void sendDHT11Data();
 void onBLEReceive(String jsonData);
-void saveCredentialsToEEPROM();
-void loadCredentialsFromEEPROM();
 void handleResetButton();
-void resetDevice();
 void callback(char *topic, byte *payload, unsigned int length);
 void readRFID();
-
-class MyBLECallbacks : public BLECharacteristicCallbacks
-{
-    void onWrite(BLECharacteristic *pCharacteristic) override
-    {
-        String rxData = pCharacteristic->getValue().c_str();
-        if (rxData.length() > 0)
-        {
-            Serial.println("Received credentials over BLE");
-            rxValue += rxData;
-            Serial.println("Received Data: " + rxValue);
-            if (rxValue.indexOf(';') != -1)
-            {
-                onBLEReceive(rxValue);
-                Serial.println("BLECALLBACK.LOG -> " + rxValue);
-                rxValue = "";
-            }
-        }
-        else
-        {
-            Serial.println("Received empty data");
-        }
-    }
-};
+bool downloadFirmware(const char *deviceToken, const char *fwTitle, const char *fwVersion, const char *savePath = NULL);
+void checkAndUpdateFirmware(const char *deviceToken, String fwTitle, String fwVersion);
+void performUpdate(const char *filePath);
 
 void setup()
 {
     Serial.begin(115200);
-    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+    if (!SPIFFS.begin())
+    {
+        Serial.println("Failed to mount file system");
+        return;
+    }
+    pinMode(SERVO_PIN, OUTPUT);
     SPI.begin();
     rfid.PCD_Init();
-
-    myServo.attach(SERVO_PIN);
-    myServo.write(0); // Mở ở góc 0 độ
-
+    digitalWrite(SERVO_PIN, LOW);
     client.setCallback(callback);
-    EEPROM.begin(EEPROM_SIZE);
-    loadCredentialsFromEEPROM();
     setWarnLed(0);
-    if (statusDevice == "no_data")
-    {
-        setWarnLed(2);
-        Serial.println("No data found in EEPROM");
-        setupBLE();
-        while (statusDevice != "connected")
-        {
-            if (isChangedData)
-            {
-                connectToWiFi(wifiSSID, wifiPass);
-                if (wifiConnected)
-                {
-                    connectToMQTT();
-                }
-                if (mqttConnected)
-                {
-                    String message = "SUCCESS";
-                    pCharacteristic->setValue(message.c_str());
-                    pCharacteristic->notify();
-                    Serial.println("BLE notification sent: " + message);
-                    saveCredentialsToEEPROM();
-                    statusDevice = "connected";
-                    isChangedData = false;
-                }
-            }
-            delay(2000);
-        }
-        BLEDevice::deinit();         // Tắt BLE stack
-        esp_bt_controller_disable(); // Tắt Bluetooth controller
-        setWarnLed(1);
-    }
     connectToWiFi(wifiSSID, wifiPass);
 }
 
@@ -135,25 +81,6 @@ bool isLongPressHandled = false;
 
 void loop()
 {
-    if (digitalRead(BUTTON_PIN) == LOW)
-    { // Nút nhấn được bấm (mức LOW)
-        if (pressStartTime == 0)
-        {
-            pressStartTime = millis(); // Lưu thời gian bắt đầu nhấn
-        }
-
-        if (millis() - pressStartTime >= 3000 && !isLongPressHandled)
-        {
-            Serial.println("Button held for more than 3s!");
-            isLongPressHandled = true; // Đảm bảo chỉ chạy một lần khi giữ lâu
-        }
-    }
-    else
-    { // Khi nút được thả ra
-        pressStartTime = 0;
-        isLongPressHandled = false;
-    }
-
     if (WiFi.status() != WL_CONNECTED)
     {
         WiFi.disconnect();
@@ -169,9 +96,11 @@ void loop()
     }
     if (WiFi.status() == WL_CONNECTED && mqttConnected)
     {
+        if (!client.connected())
+            connectToMQTT();
         client.loop();
         readRFID();
-        delay(1000);
+        delay(100);
     }
 }
 
@@ -224,7 +153,7 @@ bool connectToMQTT()
         Serial.println("MQTT connected");
         mqttConnected = true;
         client.subscribe("v1/devices/me/attributes");
-        String request = "{\"sharedKeys\":\"lightState,RFID_UIDs\"}";
+        String request = "{\"sharedKeys\":\"servoState,RFID_UIDs,fw_title,fw_version\"}";
         client.publish("v1/devices/me/attributes/request/1", request.c_str());
         return true;
     }
@@ -234,107 +163,6 @@ bool connectToMQTT()
         mqttConnected = false;
         return false;
     }
-}
-
-void setupBLE()
-{
-    BLEDevice::init("ESP32_BLE");
-    pServer = BLEDevice::createServer();
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_WRITE |
-            BLECharacteristic::PROPERTY_NOTIFY);
-    pCharacteristic->setCallbacks(new MyBLECallbacks());
-    pService->start();
-    pServer->getAdvertising()->start();
-    Serial.println("BLE setup complete, waiting for credentials...");
-}
-
-void onBLEReceive(String jsonData)
-{
-    DynamicJsonDocument doc(512);
-    DeserializationError error = deserializeJson(doc, jsonData);
-    if (error)
-    {
-        Serial.print("Failed to parse JSON: ");
-        Serial.println(error.c_str());
-        return;
-    }
-    if (doc.containsKey("reset") && doc["reset"] == true)
-    {
-        Serial.println("Reset command received via BLE. Resetting device...");
-        resetDevice();
-        return;
-    }
-    strcpy(wifiSSID, doc["ssid"]);
-    strcpy(wifiPass, doc["password"]);
-    strcpy(mqttUser, doc["mqttUser"]);
-    strcpy(mqttServer, doc["mqttServer"]);
-    mqttPort = doc["mqttPort"];
-    Serial.printf("onBLEReceive.LOG -> SSI: %s\n", wifiSSID);
-    Serial.printf("onBLEReceive.LOG -> PASSWORD: %s\n", wifiPass);
-    Serial.printf("onBLEReceive.LOG -> MQTTUSER: %s\n", mqttUser);
-    Serial.printf("onBLEReceive.LOG -> MQTTSERVER: %s\n", mqttServer);
-    Serial.printf("onBLERecevie.LOG -> MQTTPORT: $d\n", mqttPort);
-    isChangedData = true;
-}
-
-void saveCredentialsToEEPROM()
-{
-    EEPROM.writeString(0, wifiSSID);
-    EEPROM.writeString(32, wifiPass);
-    EEPROM.writeString(96, mqttUser);
-    EEPROM.writeString(128, mqttServer);
-    // mqttPort
-    EEPROM.write(160, (uint8_t)(mqttPort >> 8));   // Byte cao
-    EEPROM.write(161, (uint8_t)(mqttPort & 0xFF)); // Byte thấp
-
-    EEPROM.commit();
-    Serial.printf("SAVE_EROM.LOG -> SSI: %s\n", wifiSSID);
-    Serial.printf("SAVE_EROM.LOG -> PASSWORD: %s\n", wifiPass);
-    Serial.printf("SAVE_EROM.LOG -> MQTTUSER: %s\n", mqttUser);
-    Serial.printf("SAVE_EROM.LOG -> MQTTSERVER: %s\n", mqttServer);
-    Serial.printf("SAVE_EROM.LOAD.LOG -> MQTTPORT: %d\n", mqttPort);
-    Serial.println("Credentials saved to EEPROM.");
-}
-
-void loadCredentialsFromEEPROM()
-{
-    EEPROM.readString(0, wifiSSID, 32);
-    EEPROM.readString(32, wifiPass, 64);
-    EEPROM.readString(96, mqttUser, 32);
-    EEPROM.readString(128, mqttServer, 32);
-    // read mqttPort
-    mqttPort = (EEPROM.read(160) << 8) | EEPROM.read(161);
-
-    Serial.printf("SAVE_EROM.LOAD.LOG -> SSI: %s\n", wifiSSID);
-    Serial.printf("SAVE_EROM.LOAD.LOG -> PASSWORD: %s\n", wifiPass);
-    Serial.printf("SAVE_EROM.LOAD.LOG -> MQTTUSER: %s\n", mqttUser);
-    Serial.printf("SAVE_EROM.LOAD.LOG -> MQTTSERVER: %s\n", mqttServer);
-    Serial.printf("SAVE_EROM.LOAD.LOG -> MQTTPORT: %d\n", mqttPort);
-
-    if (strlen(wifiSSID) == 0 || strlen(wifiPass) == 0 || strlen(mqttUser) == 0 || strlen(mqttServer) == 0)
-    {
-        statusDevice = "no_data";
-        Serial.println("No data found in EEPROM");
-    }
-    else
-    {
-        statusDevice = "data_found";
-        Serial.println("Credentials loaded from EEPROM.");
-    }
-}
-
-void resetDevice()
-{
-    memset(wifiSSID, 0, sizeof(wifiSSID));
-    memset(wifiPass, 0, sizeof(wifiPass));
-    memset(mqttUser, 0, sizeof(mqttUser));
-    memset(mqttServer, 0, sizeof(mqttServer));
-    mqttPort = 0;
-    saveCredentialsToEEPROM();
-    ESP.restart();
 }
 
 void callback(char *topic, byte *payload, unsigned int length)
@@ -366,26 +194,29 @@ void callback(char *topic, byte *payload, unsigned int length)
         }
 
         //  servo
-        if (doc["share"]["servoState"])
+        if (doc["shared"]["servoState"])
         {
             int servoState = doc["shared"]["servoState"];
             if (servoState == 1)
             {
-                myServo.write(90); // Quay servo đến 90 độ
-                delay(3000);       // Giữ trạng thái mở trong 3 giây
-                myServo.write(0);  // Quay lại vị trí ban đầu
+                client.publish(mqttTopic, String("{\"RFID\":\"APP\", \"open\": true}").c_str());
+                digitalWrite(SERVO_PIN, HIGH);
             }
         }
 
         // neu nhan duoc message moi servoState
-        if (doc["servoState"])
+        if (doc.containsKey("servoState"))
         {
             int servoState = doc["servoState"];
             if (servoState == 1)
             {
-                myServo.write(90); // Quay servo đến 90 độ
-                delay(3000);       // Giữ trạng thái mở trong 3 giây
-                myServo.write(0);  // Quay lại vị trí ban đầu
+                digitalWrite(SERVO_PIN, HIGH);
+                client.publish(mqttTopic, String("{\"RFID\":\"APP\", \"open\": true}").c_str());
+            }
+            else
+            {
+                digitalWrite(SERVO_PIN, LOW);
+                client.publish(mqttTopic, String("{\"RFID\":\"APP\", \"open\": false}").c_str());
             }
         }
 
@@ -401,6 +232,52 @@ void callback(char *topic, byte *payload, unsigned int length)
                     rfid_uids[i] = uid;
                     i++;
                 }
+            }
+        }
+
+        if (doc["helloWorld"] == "ota")
+        {
+            Serial.println("TEST OTA");
+        }
+
+        // if(doc["shared"].containsKey("fw_version")){
+        //   Serial.println("Phiên bản MQTT gửi về: " + String(doc["shared"]["fw_version"]));
+        //   Serial.println("Phiên bản HIỆN TẠI : " + String(fw_version));
+        //   if(!strcmp(fw_version, doc["shared"]["fw_version"])){
+        //     Serial.println("BẮT ĐẦU UPDATE");
+        //     checkAndUpdateFirmware(mqttUser, doc["shared"]["fw_title"].as<const char*>(), doc["shared"]["fw_version"].as<const char*>());
+        //     fw_version = strdup(doc["shared"]["fw_version"].as<const char*>());
+        //   }
+        // }
+
+        // Then modify your version check logic:
+        if (doc["shared"].containsKey("fw_version"))
+        {
+            String new_version = doc["shared"]["fw_version"].as<String>();
+            Serial.println("Phiên bản MQTT gửi về: " + new_version);
+            Serial.println("Phiên bản HIỆN TẠI : " + fw_version);
+
+            if (fw_version != new_version)
+            {
+                Serial.println("BẮT ĐẦU UPDATE");
+                String new_title = doc["shared"]["fw_title"].as<String>();
+                checkAndUpdateFirmware(mqttUser, new_title.c_str(), new_version.c_str());
+                fw_version = new_version;
+            }
+        }
+
+        if (doc.containsKey("fw_version"))
+        {
+            String new_version = doc["fw_version"].as<String>();
+            Serial.println("Phiên bản MQTT gửi về: " + new_version);
+            Serial.println("Phiên bản HIỆN TẠI : " + fw_version);
+
+            if (fw_version != new_version)
+            {
+                Serial.println("BẮT ĐẦU UPDATE");
+                String new_title = doc["fw_title"].as<String>();
+                checkAndUpdateFirmware(mqttUser, new_title.c_str(), new_version.c_str());
+                fw_version = new_version;
             }
         }
     }
@@ -422,18 +299,183 @@ void readRFID()
 
     for (int i = 0; i < 10; i++)
     {
+        client.loop(); // Đảm bảo MQTT luôn hoạt động
         Serial.println(rfid_uids[i]);
+
         if (rfid_uids[i] == uid)
         {
             Serial.println("Access granted! Moving servo...");
-            myServo.write(90); // Quay servo đến 90 độ
-            client.publish(mqttTopic, String("{\"RFID_OPEN\":\"" + uid + "\"}").c_str());
-            delay(3000);      // Giữ trạng thái mở trong 3 giây
-            myServo.write(0); // Quay lại vị trí ban đầu
-            client.publish(mqttTopic, String("{\"RFID_CLOSE\":\"" + uid + "\"}").c_str());
+            digitalWrite(SERVO_PIN, HIGH);
+            client.publish(mqttTopic, String("{\"RFID\":\"" + uid + "\", \"open\": true}").c_str());
+
+            // Sử dụng while thay vì delay
+            unsigned long startTime = millis();
+            while (millis() - startTime < 3000)
+            {
+                client.loop(); // Đảm bảo MQTT vẫn chạy khi chờ
+
+                yield(); // Cho phép ESP8266 xử lý tác vụ nền (WiFi, MQTT, watchdog)
+            }
+
+            digitalWrite(SERVO_PIN, LOW);
+            client.publish(mqttTopic, String("{\"RFID\":\"" + uid + "\", \"open\": false}").c_str());
             return;
         }
     }
     Serial.println("Access denied!");
 }
-530
+
+// Hàm tải firmware từ ThingsBoard
+bool downloadFirmware(const char *deviceToken, const char *fwTitle, const char *fwVersion, const char *savePath)
+{
+    HTTPClient http;
+
+    // Xây dựng URL request
+    String url = "http://" + String(mqttServer) + ":8080/api/v1/";
+    url += String(deviceToken);
+    url += "/firmware?title=";
+    url += String(fwTitle);
+    url += "&version=";
+    url += String(fwVersion);
+
+    // if (chunkSize > 0) {
+    //   url += "&size=";
+    //   url += chunkSize;
+    //   url += "&chunk=";
+    //   url += chunk;
+    // }
+
+    Serial.print("Requesting firmware from: ");
+    Serial.println(url);
+
+    if (!http.begin(espClient, url))
+    {
+        Serial.println("Failed to begin HTTP connection");
+        return false;
+    }
+
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK)
+    {
+        Serial.println("Firmware download started");
+
+        // Nếu không chỉ định savePath, trả về true nếu request thành công
+        if (savePath == NULL)
+        {
+            http.end();
+            return true;
+        }
+
+        // Mở file để ghi firmware
+        File file = SPIFFS.open(savePath, "w");
+        if (!file)
+        {
+            Serial.println("Failed to open file for writing");
+            http.end();
+            return false;
+        }
+
+        // Nhận dữ liệu và ghi vào file
+        int len = http.getSize();
+        uint8_t buff[128] = {0};
+        WiFiClient *stream = http.getStreamPtr();
+
+        while (http.connected() && (len > 0 || len == -1))
+        {
+            size_t size = stream->available();
+            if (size)
+            {
+                int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+                file.write(buff, c);
+                if (len > 0)
+                {
+                    len -= c;
+                }
+                Serial.print(".");
+            }
+            delay(1);
+        }
+
+        file.close();
+        Serial.println("\nFirmware download complete");
+        http.end();
+        return true;
+    }
+    else
+    {
+        Serial.printf("HTTP request failed, error: %s\n", http.errorToString(httpCode).c_str());
+        http.end();
+        return false;
+    }
+}
+
+// Hàm kiểm tra và cập nhật firmware
+void checkAndUpdateFirmware(const char *deviceToken, const char *fwTitle, const char *fwVersion)
+{
+    // Tải firmware
+    const char *binFile = "/firmware.bin";
+    if (downloadFirmware(deviceToken, fwTitle, fwVersion, binFile))
+    {
+        // Tiến hành cập nhật firmware
+        performUpdate(binFile);
+    }
+}
+
+// Hàm cập nhật firmware
+void performUpdate(const char *filePath)
+{
+    File updateFile = SPIFFS.open(filePath, "r");
+    if (!updateFile)
+    {
+        Serial.println("Failed to open firmware file");
+        return;
+    }
+
+    size_t updateSize = updateFile.size();
+    if (updateSize == 0)
+    {
+        Serial.println("Firmware file is empty");
+        updateFile.close();
+        return;
+    }
+
+    Serial.println("Starting firmware update...");
+    if (Update.begin(updateSize))
+    {
+        size_t written = Update.writeStream(updateFile);
+        if (written == updateSize)
+        {
+            Serial.println("Firmware written successfully");
+        }
+        else
+        {
+            Serial.printf("Firmware written %d/%d bytes\n", written, updateSize);
+        }
+
+        if (Update.end())
+        {
+            Serial.println("OTA done!");
+            if (Update.isFinished())
+            {
+                Serial.println("Update successfully completed. Rebooting...");
+                updateFile.close();
+                ESP.restart();
+            }
+            else
+            {
+                Serial.println("Update not finished? Something went wrong!");
+            }
+        }
+        else
+        {
+            Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+        }
+    }
+    else
+    {
+        Serial.println("Not enough space to begin OTA");
+    }
+
+    updateFile.close();
+}
